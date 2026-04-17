@@ -43,7 +43,7 @@ class VoiceAssistant:
             print("Слушаю...")
             
             try:
-                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
+                audio = self.recognizer.listen(source, timeout=10, phrase_time_limit=30)
                 print("Распознаю речь...")
                 
                 # Пытаемся распознать речь используя встроенный распознаватель
