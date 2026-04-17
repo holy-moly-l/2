@@ -1,18 +1,49 @@
 #!/usr/bin/env python3
 """
-Голосовой ассистент для Arch Linux
-Распознает голосовые команды и выполняет их
+Голосовой ассистент для Arch Linux с локальным ИИ
+Распознает голосовые команды, отвечает через ИИ и озвучивает ответы
 """
 
 import speech_recognition as sr
 import subprocess
 import os
 import sys
+import json
+import urllib.request
+import urllib.error
+
+# Попытка импорта pyttsx3 для офлайн TTS
+try:
+    import pyttsx3
+    TTS_ENGINE = "pyttsx3"
+except ImportError:
+    TTS_ENGINE = None
 
 class VoiceAssistant:
-    def __init__(self):
+    def __init__(self, use_ai=True, ai_model="llama3.2"):
         self.recognizer = sr.Recognizer()
         self.microphone = sr.Microphone()
+        self.use_ai = use_ai
+        self.ai_model = ai_model
+        self.ollama_url = "http://localhost:11434/api/generate"
+        
+        # Инициализация TTS
+        self.tts_engine = None
+        if TTS_ENGINE == "pyttsx3":
+            try:
+                self.tts_engine = pyttsx3.init()
+                self.tts_engine.setProperty('rate', 150)
+                self.tts_engine.setProperty('volume', 0.9)
+                # Попытка установить русский голос
+                voices = self.tts_engine.getProperty('voices')
+                for voice in voices:
+                    if 'ru' in voice.languages or 'russian' in voice.name.lower():
+                        self.tts_engine.setProperty('voice', voice.id)
+                        break
+                print(f"TTS движок: pyttsx3 (офлайн)")
+            except Exception as e:
+                print(f"Ошибка инициализации pyttsx3: {e}")
+                self.tts_engine = None
         
         # Команды, которые может выполнять ассистент
         self.commands = {
@@ -35,6 +66,61 @@ class VoiceAssistant:
         
         self.running = True
         
+    def speak(self, text):
+        """Озвучивает текст через TTS"""
+        if not text:
+            return
+        
+        print(f"Ответ: {text}")
+        
+        if self.tts_engine:
+            try:
+                self.tts_engine.say(text)
+                self.tts_engine.runAndWait()
+            except Exception as e:
+                print(f"Ошибка TTS: {e}")
+        else:
+            # Fallback: используем системный tts если доступен
+            try:
+                subprocess.run(["espeak", "-v", "ru", text], check=False)
+            except FileNotFoundError:
+                pass  # espeak не установлен
+    
+    def query_ai(self, user_input):
+        """Отправляет запрос к локальной ИИ модели через Ollama"""
+        if not self.use_ai:
+            return None
+        
+        prompt = f"""Ты голосовой помощник для Linux. Отвечай кратко и по делу на русском языке.
+Пользователь сказал: {user_input}
+Если это команда для системы (открыть приложение, показать время и т.д.), ответь что выполняю.
+Если это вопрос или беседа - дай полезный краткий ответ."""
+
+        data = {
+            "model": self.ai_model,
+            "prompt": prompt,
+            "stream": False
+        }
+        
+        try:
+            req = urllib.request.Request(
+                self.ollama_url,
+                data=json.dumps(data).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            with urllib.request.urlopen(req, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                return result.get('response', '').strip()
+                
+        except urllib.error.URLError as e:
+            print(f"Ошибка подключения к Ollama: {e}")
+            print("Убедитесь, что Ollama запущен: ollama serve")
+            return f"Извините, ИИ недоступен. Проверьте, запущен ли Ollama с моделью {self.ai_model}"
+        except Exception as e:
+            print(f"Ошибка запроса к ИИ: {e}")
+            return None
+    
     def listen(self):
         """Слушает микрофон и распознает речь"""
         with self.microphone as source:
@@ -186,26 +272,58 @@ class VoiceAssistant:
         return subprocess.run(["which", cmd], capture_output=True).returncode == 0
     
     def execute_command(self, text):
-        """Выполняет команду по распознанному тексту"""
+        """Выполняет команду по распознанному тексту с ответом от ИИ"""
         if not text:
             return
         
-        # Ищем совпадения в командах
+        # Сначала проверяем специальные команды
         for command_phrase, command_func in self.commands.items():
             if command_phrase in text:
                 print(f"\nВыполняю команду: {command_phrase}")
+                
+                # Для команд остановки не вызываем ИИ
+                if command_func in [self.stop]:
+                    command_func()
+                    return
+                
+                # Выполняем команду
                 command_func()
+                
+                # Получаем ответ от ИИ и озвучиваем
+                if self.use_ai:
+                    ai_response = self.query_ai(f"Я выполнил команду: {command_phrase}. Подтверди выполнение кратко.")
+                    if ai_response:
+                        self.speak(ai_response)
                 return
         
-        print("Команда не распознана. Скажите 'помощь' для списка команд.")
+        # Если это не команда системы, отправляем запрос к ИИ
+        if self.use_ai:
+            print("\nЗапрос к ИИ...")
+            ai_response = self.query_ai(text)
+            if ai_response:
+                self.speak(ai_response)
+            else:
+                self.speak("Извините, я не понял команду и не смог получить ответ от ИИ.")
+        else:
+            print("Команда не распознана. Скажите 'помощь' для списка команд.")
+            self.speak("Команда не распознана")
     
     def run(self):
         """Основной цикл работы ассистента"""
         print("=" * 50)
         print("Голосовой ассистент запущен!")
+        if self.use_ai:
+            print(f"ИИ включен (модель: {self.ai_model})")
+            print("Убедитесь, что Ollama запущен: ollama serve")
+        else:
+            print("ИИ отключен, только системные команды")
         print("Скажите 'помощь' для списка команд")
         print("Скажите 'стоп' или 'выход' для завершения")
         print("=" * 50)
+        
+        # Приветственное сообщение от ИИ
+        if self.use_ai and self.tts_engine:
+            self.speak("Голосовой помощник готов к работе")
         
         while self.running:
             try:
@@ -235,6 +353,11 @@ def check_dependencies():
     except ImportError:
         missing.append("PyAudio")
     
+    try:
+        import pyttsx3
+    except ImportError:
+        print("pyttsx3 не найден - будет использоваться espeak для TTS (опционально)")
+    
     if missing:
         print("Отсутствуют необходимые зависимости:")
         for dep in missing:
@@ -242,14 +365,24 @@ def check_dependencies():
         print("\nУстановите их командой:")
         print("  sudo pacman -S python-pip python-pyaudio")
         print("  pip install SpeechRecognition")
+        print("\nДля офлайн TTS (рекомендуется):")
+        print("  pip install pyttsx3")
+        print("  sudo pacman -S espeak-ng")
         return False
     
     return True
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Голосовой ассистент с локальным ИИ")
+    parser.add_argument("--no-ai", action="store_true", help="Отключить ИИ, только системные команды")
+    parser.add_argument("--model", type=str, default="llama3.2", help="Модель Ollama (по умолчанию: llama3.2)")
+    args = parser.parse_args()
+    
     if not check_dependencies():
         sys.exit(1)
     
-    assistant = VoiceAssistant()
+    assistant = VoiceAssistant(use_ai=not args.no_ai, ai_model=args.model)
     assistant.run()
